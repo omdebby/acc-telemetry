@@ -19,6 +19,7 @@ recordings that don't have those columns.
 """
 
 import argparse
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -105,7 +106,7 @@ def to_bool(value):
     """Parse a CSV validity flag; None when unknown."""
     if pd.isna(value):
         return None
-    return str(value).strip().lower() in ("true", "1", "1.0")
+    return {"true": True, "1": True, "1.0": True, "false": False, "0": False, "0.0": False}.get(str(value).strip().lower())
 
 
 def runs_of_true(mask):
@@ -142,9 +143,20 @@ def load_telemetry(path):
 
     missing = [c for c in REQUIRED_COLUMNS if c not in data.columns]
     if missing:
-        sys.exit(f"{path} is missing columns: {', '.join(missing)}")
+        raise ValueError(f"{path} is missing columns: {', '.join(missing)}")
 
-    data = data.dropna(subset=["lap_number", "lap_time", "speed_kmh"])
+    for column in set(REQUIRED_COLUMNS + ["track_position", "last_lap_time", "pos_x", "pos_z"]):
+        if column in data:
+            data[column] = pd.to_numeric(data[column], errors="coerce")
+    data = data.replace([np.inf, -np.inf], np.nan).dropna(subset=REQUIRED_COLUMNS).copy()
+    if data.empty:
+        raise ValueError("No usable telemetry samples found.")
+    if (data["lap_number"].diff() < 0).any():
+        raise ValueError("Recording contains a session restart. Split into sessions before comparing.")
+    if (data["lap_number"] % 1 != 0).any() or (data["lap_time"] < 0).any():
+        raise ValueError("Lap numbers must be integers and times non-negative.")
+    if "track_position" in data:
+        data.loc[~data["track_position"].between(0, 1), "track_position"] = np.nan
     data["lap_number"] = data["lap_number"].astype(int)
     return data
 
@@ -157,7 +169,7 @@ def official_time_ms(data, lap_number):
     following = data[data["lap_number"] == lap_number + 1]
     following = following.sort_values("timestamp")
     values = following["last_lap_time"].dropna()
-    values = values[values > 0]
+    values = values[(values > 0) & (values < 2147483647)]
 
     if values.empty:
         return None
@@ -213,6 +225,7 @@ def find_laps(data):
             "start_ok": start_ok,
             "end_ok": end_ok,
             "measured_ms": measured_ms,
+            "crossed_line": bool((data["lap_number"] == number + 1).any()),
         })
 
     # Without track position, call a lap complete if it started at the
@@ -232,7 +245,7 @@ def find_laps(data):
             data=lap["segment"],
             time_ms=lap["time_ms"],
             valid=lap["valid"],
-            complete=bool(lap["start_ok"] and end_ok),
+            complete=bool(lap["start_ok"] and end_ok and lap["crossed_line"]),
         ))
 
     return results
@@ -242,27 +255,29 @@ def choose_laps(laps, lap_arg, reference_arg):
     complete = {lap.number: lap for lap in laps if lap.complete}
 
     if not complete:
-        sys.exit("No complete laps found in this recording.")
+        raise ValueError("No complete laps found in this recording.")
 
     # Reference: fastest valid lap (fastest of any if none are valid)
     if reference_arg is not None:
         if reference_arg not in complete:
-            sys.exit(f"Lap {reference_arg} is not a complete lap.")
+            raise ValueError(f"Lap {reference_arg} is not a complete lap.")
         reference = complete[reference_arg]
     else:
-        valid = [lap for lap in complete.values() if lap.valid is not False]
+        valid = [lap for lap in complete.values() if lap.valid is True]
+        if not valid:
+            valid = [lap for lap in complete.values() if lap.valid is None]
         pool = valid if valid else list(complete.values())
         reference = min(pool, key=lambda lap: lap.time_ms)
 
     # Lap to analyze: most recent complete lap that isn't the reference
     if lap_arg is not None:
         if lap_arg not in complete:
-            sys.exit(f"Lap {lap_arg} is not a complete lap.")
+            raise ValueError(f"Lap {lap_arg} is not a complete lap.")
         chosen = complete[lap_arg]
     else:
         others = [n for n in complete if n != reference.number]
         if not others:
-            sys.exit("Need at least two complete laps to compare.")
+            raise ValueError("Need at least two complete laps to compare.")
         chosen = complete[max(others)]
 
     return chosen, reference
@@ -284,31 +299,36 @@ def build_lap(info, use_position, length_m=None):
 
     lap["t"] = lap["lap_time"] / 1000
     dt = lap["t"].diff().fillna(0)
-    lap["raw_dist"] = (lap["speed_kmh"] / 3.6 * dt).cumsum()
-
-    if use_position and lap["track_position"].notna().all():
-        progress = lap["track_position"].to_numpy(dtype=float)
-    else:
-        progress = lap["raw_dist"].to_numpy(dtype=float)
-
-    # Progress must strictly increase for interpolation to work
-    progress = np.maximum.accumulate(progress)
-    previous_max = np.concatenate(([-np.inf], progress[:-1]))
+    speed = lap["speed_kmh"].clip(lower=0) / 3.6
+    lap["raw_dist"] = ((speed + speed.shift(fill_value=speed.iloc[0])) / 2 * dt).cumsum()
+    positioned = use_position and "track_position" in lap and lap["track_position"].notna().all()
+    progress = lap["track_position"].to_numpy(float) if positioned else lap["raw_dist"].to_numpy(float)
+    previous_max = np.concatenate(([-np.inf], np.maximum.accumulate(progress)[:-1]))
     keep = progress > previous_max
-
-    lap = lap[keep].reset_index(drop=True)
+    lap = lap.loc[keep].reset_index(drop=True)
     progress = progress[keep]
-
-    lap["progress"] = (progress - progress[0]) / (progress[-1] - progress[0])
-    lap.attrs["raw_length_m"] = float(lap["raw_dist"].iloc[-1])
-
+    if len(progress) < 2 or progress[-1] <= progress[0]:
+        raise ValueError("Lap has no usable forward progress.")
+    raw_length = float(lap["raw_dist"].iloc[-1])
+    if positioned:
+        raw_length /= progress[-1] - progress[0]
+    else:
+        progress = (progress - progress[0]) / (progress[-1] - progress[0])
+    lap["progress"] = progress
+    lap.attrs["raw_length_m"] = raw_length
+    lap.attrs["official_time_s"] = info.time_ms / 1000
+    lap.attrs["positioned"] = positioned
     if length_m is not None:
-        lap["dist_m"] = lap["progress"] * length_m
+        lap["dist_m"] = progress * length_m
 
     return lap
 
 
 def on_grid(lap, column, grid):
+    if column == "t" and lap.attrs.get("positioned"):
+        inside = lap["progress"].between(0, 1, inclusive="neither")
+        return np.interp(grid, np.r_[0, lap.loc[inside, "progress"], 1],
+                         np.r_[0, lap.loc[inside, "t"], lap.attrs["official_time_s"]])
     return np.interp(grid, lap["progress"], lap[column])
 
 
@@ -340,6 +360,8 @@ def compute_delta(lap, ref, grid):
 # ==========================================
 
 def analyze_sections(lap, ref, num_sections):
+    if num_sections < 1:
+        raise ValueError("Sections must be positive.")
     edges = np.linspace(0, 1, num_sections + 1)
     rows = []
 
@@ -349,8 +371,8 @@ def analyze_sections(lap, ref, num_sections):
         speeds = {}
 
         for name, data in (("lap", lap), ("ref", ref)):
-            t_lo = np.interp(lo, data["progress"], data["t"])
-            t_hi = np.interp(hi, data["progress"], data["t"])
+            t_lo = on_grid(data, "t", lo)
+            t_hi = on_grid(data, "t", hi)
             times[name] = t_hi - t_lo
 
             in_section = data[
@@ -443,6 +465,8 @@ def detect_corners(ref, ref_events, steer_fraction=STEER_FRACTION):
     are attached afterwards as each corner's entry, so corners with
     no braking (flat-out or lift-only) are still counted.
     """
+    if not 0 < steer_fraction <= 1:
+        raise ValueError("Steering threshold must be between 0 and 1.")
     t = ref["t"].to_numpy()
     dist = ref["dist_m"].to_numpy()
     speed = ref["speed_kmh"].to_numpy()
@@ -485,7 +509,7 @@ def detect_corners(ref, ref_events, steer_fraction=STEER_FRACTION):
         if t[end] - t[start] < MIN_CORNER_S:
             continue
 
-        apex = start + int(np.argmin(speed[start:end + 1]))
+        apex = start + int(np.argmax(np.abs(steer[start:end + 1])))
         start_dist = dist[start]
         end_dist = max(dist[end], dist[apex])
 
@@ -516,6 +540,8 @@ def detect_corners(ref, ref_events, steer_fraction=STEER_FRACTION):
 
 def tune_corners(ref, ref_events, expected):
     """Try a range of thresholds; keep the one closest to `expected`."""
+    if expected < 1:
+        raise ValueError("Expected corners must be positive.")
     best = None
     for fraction in TUNE_FRACTIONS:
         found = detect_corners(ref, ref_events, fraction)
@@ -526,9 +552,52 @@ def tune_corners(ref, ref_events, expected):
     return best[2], best[1]
 
 
+
+def load_profile(csv_path, profile_path=None):
+    if profile_path:
+        return validate_profile(json.loads(Path(profile_path).read_text(encoding="utf-8")))
+    meta = Path(csv_path).with_suffix(".meta.json")
+    if meta.exists():
+        track = str(json.loads(meta.read_text(encoding="utf-8")).get("track", "")).split("\0")[0].strip().lower()
+        if track == "barcelona":
+            return load_profile(csv_path, Path(__file__).parent / "profiles" / "barcelona.json")
+    return None
+
+
+def validate_profile(profile):
+    turns = profile.get("turns", [])
+    if not turns:
+        raise ValueError("A corner profile needs at least one turn.")
+    previous = 0
+    for i, turn in enumerate(turns, 1):
+        start, apex, end = (float(turn[k]) for k in ("start", "apex", "end"))
+        if not (0 <= start < apex < end <= 1) or start < previous:
+            raise ValueError(f"T{i}: require 0 <= start < apex < end <= 1, in order without overlap.")
+        previous = end
+    return profile
+
+
+def profile_corners(ref, events, profile):
+    validate_profile(profile)
+    if not ref.attrs.get("positioned"):
+        raise ValueError("Profiles need complete track_position data. Use automatic detection for legacy CSVs.")
+    length = ref.attrs["raw_length_m"]
+    rows, claimed = [], set()
+    for i, turn in enumerate(profile["turns"], 1):
+        start, apex, end = [float(turn[k]) * length for k in ("start", "apex", "end")]
+        k = find_brake_event(events, start - BRAKE_LEAD_M, apex, claimed)
+        brake_start = events.loc[k, "start_dist"] if k is not None else np.nan
+        rows.append(dict(corner=i, start_dist=start, apex_dist=apex, end_dist=end,
+                         apex_speed=np.interp(apex, ref["dist_m"], ref["speed_kmh"]),
+                         zone_start=min(start, brake_start) if k is not None else max(0, start-ZONE_LEAD_M),
+                         brake_start=brake_start,
+                         brake_end=events.loc[k, "end_dist"] if k is not None else np.nan))
+    return pd.DataFrame(rows, columns=CORNER_COLUMNS)
+
+
 def print_corner_list(corners, fraction):
     print("==========================================")
-    print(f"DETECTED CORNERS: {len(corners)} (steering threshold {fraction:.2f})")
+    print(f"CORNERS: {len(corners)}")
     print("==========================================")
     for _, c in corners.iterrows():
         braking = (
@@ -585,10 +654,10 @@ def window_metrics(lap, zone_start, window_end, span_start, span_end):
         out["strong_throttle"] = strong["dist_m"].iloc[0]
 
     out["speed_50"] = np.interp(
-        ref_end + EXIT_50_M, lap["dist_m"], lap["speed_kmh"]
+        ref_end + EXIT_50_M, lap["dist_m"], lap["speed_kmh"], left=np.nan, right=np.nan
     )
     out["speed_100"] = np.interp(
-        ref_end + EXIT_100_M, lap["dist_m"], lap["speed_kmh"]
+        ref_end + EXIT_100_M, lap["dist_m"], lap["speed_kmh"], left=np.nan, right=np.nan
     )
 
     exit_zone = lap[
@@ -750,8 +819,8 @@ def plot_overview(lap, ref, lap_no, ref_no, grid_dist, delta, corners):
                 c["start_dist"], c["end_dist"], color="grey", alpha=0.12
             )
         speed_ax.annotate(
-            str(int(c["corner"])),
-            xy=(c["apex_dist"], 1.0),
+            f"T{int(c['corner'])}",
+            xy=(c["apex_dist"], 1.01 + (int(c["corner"]) % 2) * 0.07),
             xycoords=("data", "axes fraction"),
             ha="center", va="bottom", fontsize=8,
         )
@@ -759,7 +828,7 @@ def plot_overview(lap, ref, lap_no, ref_no, grid_dist, delta, corners):
     for ax in axes:
         ax.grid(True, alpha=0.3)
     speed_ax.legend(loc="lower right")
-    speed_ax.set_title(f"Lap {lap_no} vs Lap {ref_no}", pad=18)
+    speed_ax.set_title(f"Lap {lap_no} vs Lap {ref_no}", pad=34)
     fig.tight_layout()
     return fig
 
@@ -842,12 +911,14 @@ def plot_track_map(ref, corners, ref_no, mirror=MIRROR_MAP):
         x = np.interp(c["apex_dist"], ref["dist_m"], px)
         z = np.interp(c["apex_dist"], ref["dist_m"], pz)
         ax.annotate(
-            str(int(c["corner"])), xy=(x, z), fontsize=9, fontweight="bold",
+            f"T{int(c['corner'])}", xy=(x, z), xytext=(14 if int(c["corner"]) % 2 else -22, 18 if int(c["corner"]) % 2 else -20),
+            textcoords="offset points", arrowprops=dict(arrowstyle="-", color="black"),
+            fontsize=9, fontweight="bold",
             bbox=dict(boxstyle="circle,pad=0.2", fc="white", ec="black"),
         )
 
     ax.set_aspect("equal")
-    ax.set_title(f"Track map (Lap {ref_no}) - numbers mark detected corners")
+    ax.set_title(f"Track map (Lap {ref_no}) - turn labels")
     ax.set_xlabel("X (mirrored)" if mirror else "X")
     ax.set_ylabel("Z")
     fig.tight_layout()
@@ -864,6 +935,8 @@ def parse_args():
         "csv", nargs="?",
         help="telemetry CSV (default: newest telemetry_*.csv here)",
     )
+    parser.add_argument("--profile", help="corner profile JSON")
+    parser.add_argument("--auto-corners", action="store_true", help="use estimated steering corners")
     parser.add_argument("--lap", type=int, help="lap to analyze")
     parser.add_argument("--reference", type=int, help="lap to compare against")
     parser.add_argument("--sections", type=int, default=10)
@@ -888,7 +961,7 @@ def parse_args():
 def find_default_csv():
     files = sorted(Path(".").glob("telemetry_*.csv"))
     if not files:
-        sys.exit("No telemetry_*.csv found. Pass a CSV path.")
+        raise ValueError("No telemetry_*.csv found. Pass a CSV path.")
     return files[-1]
 
 
@@ -920,6 +993,8 @@ def main():
 
     # Build both laps on the same distance axis. The reference lap's
     # length sets the scale, so both laps share identical distances.
+    use_position = all("track_position" in info.data and info.data["track_position"].notna().all()
+                       for info in (lap_info, ref_info))
     ref = build_lap(ref_info, use_position)
     length_m = ref.attrs["raw_length_m"]
     ref["dist_m"] = ref["progress"] * length_m
@@ -930,7 +1005,7 @@ def main():
     delta = compute_delta(lap, ref, grid)
 
     print(f"Estimated lap length: {length_m:.0f} m")
-    print(f"Final time delta from telemetry: {delta[-1]:+.3f} s")
+    print(f"Final delta (official endpoints): {delta[-1]:+.3f} s")
     print(
         f"Official time difference:        "
         f"{(lap_info.time_ms - ref_info.time_ms) / 1000:+.3f} s"
@@ -961,7 +1036,12 @@ def main():
     print()
 
     # Corners come from steering, with braking zones attached as entries
-    if args.corners:
+    profile = None if args.auto_corners else load_profile(csv_path, args.profile)
+    if profile is not None and ref.attrs.get("positioned"):
+        ref_corners = profile_corners(ref, ref_events, profile)
+        fraction = args.steer_fraction
+        print(f"Corner profile: {profile['name']}")
+    elif args.corners:
         ref_corners, fraction = tune_corners(ref, ref_events, args.corners)
     else:
         fraction = args.steer_fraction
@@ -994,8 +1074,9 @@ def main():
         figures["corners"] = plot_corners(corners, lap_no, ref_no)
 
     can_map = (
-        use_position
+        {"pos_x", "pos_z"}.issubset(ref.columns)
         and ref[["pos_x", "pos_z"]].notna().all().all()
+        and ref[["pos_x", "pos_z"]].std().max() > 1
     )
     if can_map:
         figures["track_map"] = plot_track_map(
@@ -1013,6 +1094,9 @@ def main():
 
     if not args.no_show:
         plt.show()
+    else:
+        for fig in figures.values():
+            plt.close(fig)
 
 
 if __name__ == "__main__":

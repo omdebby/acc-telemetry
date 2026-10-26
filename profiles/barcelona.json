@@ -1,0 +1,88 @@
+{
+  "name": "Barcelona \u2014 ACC GP with final chicane (16 turns)",
+  "track": "barcelona",
+  "description": "Normalized track-position windows calibrated against October 2026 recordings. Turn order checked against the circuit 2017 official map; boundaries and label anchors are telemetry-derived, not official surveyed coordinates.",
+  "source": "https://www.circuitcat.com/wp-content/uploads/2017/01/Manual-del-Oficial-de-Carrera-2017.pdf",
+  "turns": [
+    {
+      "start": 0.173,
+      "apex": 0.18905,
+      "end": 0.197
+    },
+    {
+      "start": 0.198,
+      "apex": 0.20693,
+      "end": 0.224
+    },
+    {
+      "start": 0.227,
+      "apex": 0.24954,
+      "end": 0.317
+    },
+    {
+      "start": 0.365,
+      "apex": 0.3797,
+      "end": 0.432
+    },
+    {
+      "start": 0.45,
+      "apex": 0.46307,
+      "end": 0.486
+    },
+    {
+      "start": 0.502,
+      "apex": 0.50743,
+      "end": 0.53
+    },
+    {
+      "start": 0.542,
+      "apex": 0.55106,
+      "end": 0.565
+    },
+    {
+      "start": 0.568,
+      "apex": 0.58333,
+      "end": 0.591
+    },
+    {
+      "start": 0.611,
+      "apex": 0.63301,
+      "end": 0.658
+    },
+    {
+      "start": 0.749,
+      "apex": 0.75753,
+      "end": 0.77
+    },
+    {
+      "start": 0.774,
+      "apex": 0.78765,
+      "end": 0.794
+    },
+    {
+      "start": 0.797,
+      "apex": 0.80755,
+      "end": 0.841
+    },
+    {
+      "start": 0.857,
+      "apex": 0.87053,
+      "end": 0.879
+    },
+    {
+      "start": 0.887,
+      "apex": 0.89638,
+      "end": 0.901
+    },
+    {
+      "start": 0.902,
+      "apex": 0.90403,
+      "end": 0.916
+    },
+    {
+      "start": 0.918,
+      "apex": 0.94667,
+      "end": 0.965
+    }
+  ]
+}

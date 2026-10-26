@@ -22,7 +22,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from pyaccsharedmemory import accSharedMemory
+
 
 
 # ---------------------------------------------------------
@@ -124,15 +124,19 @@ def is_live(graphics):
     status = first_attr(graphics, ("status",))
     if status is None:
         return True  # can't tell, so don't block recording
-    return "LIVE" in enum_name(status).upper()
+    return status == 2 or enum_name(status).upper().split(".")[-1] in ("LIVE", "ACC_LIVE", "AC_LIVE")
 
 
 def player_coordinates(graphics):
     """Player's world position as (x, y, z), or (None, None, None)."""
     try:
-        coords = graphics.car_coordinates[graphics.player_car_id]
+        ids = first_attr(graphics, ("car_id", "car_ids"))
+        if ids is None:
+            return None, None, None
+        index = list(ids).index(graphics.player_car_id)
+        coords = graphics.car_coordinates[index]
         return coords.x, coords.y, coords.z
-    except (AttributeError, IndexError, TypeError):
+    except (AttributeError, IndexError, TypeError, ValueError):
         return None, None, None
 
 
@@ -143,7 +147,7 @@ def build_row(physics, graphics, current_time, session_time):
     row = {
         "timestamp": current_time,
         "session_time": rounded(session_time, 3),
-        "packet_id": first_attr(physics, ("packet_id",)),
+        "packet_id": first_attr(physics, ("packet_id", "packed_id", "packetID")),
 
         "lap_number": graphics.completed_lap,
         "lap_time": graphics.current_time,
@@ -192,7 +196,10 @@ def write_metadata(path, static, interval, filename):
         "car_model": first_attr(static, ("car_model",)),
         "columns": COLUMNS,
     }
-    with open(path, "w") as f:
+    for key in ("track", "car_model"):
+        if isinstance(meta[key], str):
+            meta[key] = meta[key].split("\0")[0].strip()
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, default=str)
 
 
@@ -243,11 +250,14 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if not 0.001 <= args.interval <= 10:
+        raise ValueError("Sample interval must be between 0.001 and 10 seconds.")
+    from pyaccsharedmemory import accSharedMemory
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     csv_path = output_dir / f"telemetry_{stamp}.csv"
     meta_path = output_dir / f"telemetry_{stamp}.meta.json"
 
